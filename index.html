@@ -459,6 +459,16 @@
         <span class="note">The Dynamics <b>item master</b> (&ldquo;Item - bar code&rdquo; export, .xlsx), exactly as downloaded &mdash; about a minute to read. It gives every product its bar code, name, size, category, design (search name) and, for kits, how many pieces they hold. Or a CSV with columns barcode, sku, description, category, size.</span>
       </div>
 
+      <div class="step" id="share-step">
+        <span class="t">3b &nbsp;Send the product list to all stores</span>
+        <div class="note" id="share-state"></div>
+        <div class="row">
+          <input type="password" id="share-pass" placeholder="HQ password" autocomplete="off">
+          <button class="btn primary" id="share-send" type="button">Send to all stores</button>
+        </div>
+        <span class="note">Each week, after loading the new item master: type the HQ password and send. Every store laptop picks it up the next time it is open with internet, in the background &mdash; nobody has to load the item master at the stores. Products recorded in stock keep their place: a product is its bar code.</span>
+      </div>
+
       <div class="step">
         <span class="t">4 &nbsp;Labels</span>
         <div class="row">
@@ -4195,6 +4205,8 @@ const storageBlocked = () => persistFailed;
  * @property {string} source
  * @property {string} [erpStore]  the D365 store number (S2004EMP): which rows of a sales file are ours
  * @property {string[]} [salesIgnore]  item prefixes never refilled from a shelf (bags, boxes)
+ * @property {import('../src/sync/products.js').ProductsInfo} [productsInfo]
+ *   where the product list came from: a file loaded here, or HQ's weekly send (app/products-share.js)
  */
 
 /** @type {Catalog} */
@@ -5769,6 +5781,408 @@ async function sendBatch() {
   }
 }
 
+// ===== src/sync/products.js =====
+/**
+ * The product list HQ sends to every store (Asim, 3 November 2026: "master
+ * should be loaded by the admin and once in it should be available for all
+ * stores"). The item master is refreshed every week and grows, so this runs
+ * weekly: HQ loads the new item master once, sends it, and each store laptop
+ * picks it up in the background (app/products-share.js).
+ *
+ * How it travels: the list as rows (no repeated field names), gzipped, in
+ * base64, cut into pieces the Google script stores and hands out one at a
+ * time. Google publishes no size limit for one request to a script, so a piece
+ * stays at about 1 MB. Measured on the 27 October item master (345,998
+ * products): 56.3 MB of rows -> 5.6 MB gzipped -> 7.4 MB of base64, 8 pieces.
+ *
+ * Only platform pieces every browser and Node has (CompressionStream, atob,
+ * btoa), so the whole round trip is tested in Node (test/products.test.js).
+ */
+
+/** Characters in one piece: the script stores it in 25 cells of 40,000 (server/Code.gs). */
+const PIECE_CHARS = 1000000;
+
+/** The fields of a product, in the order a row carries them. */
+const PRODUCT_FIELDS = /** @type {const} */ (['id', 'sku', 'description', 'category', 'styleCode', 'size', 'design', 'kitSize']);
+
+/**
+ * Where this laptop's product list came from - kept with the store's setup.
+ * @typedef {object} ProductsInfo
+ * @property {'file'|'hq'} from  loaded from a file on this laptop, or sent by HQ
+ * @property {string} at         when: the load, or HQ's send
+ * @property {string} name       the file it was read from
+ * @property {number} count      products
+ * @property {string} [version]  the shared list it is (taken, or sent from here)
+ */
+
+/**
+ * The shared list as the script describes it.
+ * @typedef {object} SharedProducts
+ * @property {string} version
+ * @property {number} pieces
+ * @property {number} count
+ * @property {number} chars   base64 characters, all pieces together
+ * @property {string} name
+ * @property {string} sentAt
+ */
+
+/**
+ * The product list as text: one row per product, fields in PRODUCT_FIELDS
+ * order. A field the product does not have is left off the end of its row, so
+ * "not a kit" (no kitSize) and "a kit whose size could not be read" (null)
+ * stay different.
+ *
+ * @param {readonly import('../domain/types.js').SkuRef[]} skus
+ * @param {readonly (readonly [string, string])[]} barcodes
+ * @returns {string}
+ */
+function packProducts(skus, barcodes) {
+  const rows = skus.map((s) => {
+    const row = PRODUCT_FIELDS.map((f) => s[f]);
+    while (row.length && row[row.length - 1] === undefined) row.pop();
+    return row.map((v) => (v === undefined ? null : v));
+  });
+  return JSON.stringify({ v: 1, fields: PRODUCT_FIELDS, skus: rows, barcodes });
+}
+
+/**
+ * @param {string} text  what packProducts made
+ * @returns {{skus: import('../domain/types.js').SkuRef[], barcodes: [string, string][]}}
+ */
+function unpackProducts(text) {
+  const data = JSON.parse(text);
+  if (!data || data.v !== 1 || !Array.isArray(data.skus) || !Array.isArray(data.barcodes)) {
+    throw new Error('The product list did not arrive in a form this app reads.');
+  }
+  /** @type {string[]} */
+  const fields = data.fields;
+  const skus = data.skus.map((/** @type {unknown[]} */ row) => {
+    /** @type {Record<string, unknown>} */
+    const s = {};
+    row.forEach((v, i) => {
+      const f = fields[i];
+      if (f) s[f] = v;
+    });
+    return /** @type {import('../domain/types.js').SkuRef} */ (s);
+  });
+  return { skus, barcodes: data.barcodes };
+}
+
+/**
+ * @param {string} text
+ * @returns {Promise<Uint8Array>}
+ */
+async function gzipText(text) {
+  const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+/**
+ * Throws on a damaged or cut-off list: gzip carries its own check of the whole.
+ * @param {Uint8Array} bytes
+ * @returns {Promise<string>}
+ */
+async function gunzipText(bytes) {
+  const stream = new Blob([/** @type {BlobPart} */ (bytes)]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Response(stream).text();
+}
+
+/**
+ * @param {Uint8Array} bytes
+ * @returns {string}
+ */
+function toBase64(bytes) {
+  let binary = '';
+  // a slice at a time: one call with millions of arguments overflows the stack
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(binary);
+}
+
+/**
+ * @param {string} text
+ * @returns {Uint8Array}
+ */
+function fromBase64(text) {
+  const binary = atob(text);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+/**
+ * @param {string} text
+ * @param {number} [size]
+ * @returns {string[]}
+ */
+function splitPieces(text, size = PIECE_CHARS) {
+  const pieces = [];
+  for (let i = 0; i < text.length; i += size) pieces.push(text.slice(i, i + size));
+  return pieces;
+}
+
+/**
+ * Should this laptop take the list HQ sent? Yes when it has none, when it is
+ * on an earlier shared list, or when its own file was loaded before HQ sent
+ * this one. A laptop whose own file is newer keeps it until HQ sends again.
+ *
+ * @param {SharedProducts|null|undefined} shared
+ * @param {ProductsInfo|undefined} mine
+ * @param {number} myCount  products on this laptop now
+ */
+function shouldTakeShared(shared, mine, myCount) {
+  if (!shared || !shared.version || !(shared.count > 0)) return false;
+  if (!myCount || !mine) return true;
+  if (mine.version === shared.version) return false;
+  if (mine.from === 'hq') return true;
+  return Date.parse(shared.sentAt) > Date.parse(mine.at);
+}
+
+// ===== app/products-share.js =====
+/**
+ * The product list from HQ to every store laptop, through the Google script.
+ *
+ * HQ loads the item master once (each week; more products are added every
+ * time) and sends it from setup. A store laptop asks the script when it opens
+ * and every few hours whether HQ has sent a newer list, fetches it in the
+ * background, and puts it in place after a minute without scanning - putting
+ * 346,000 products in place takes a few seconds. Scanning never waits for any
+ * of this, and a failed fetch is simply tried again later. What travels and
+ * when a laptop takes it: src/sync/products.js.
+ *
+ * Product ids are the bar code (src/data/itemMaster.js), so recorded stock
+ * keeps its products when a new list replaces the old one.
+ */
+
+
+
+
+/** How often an open laptop asks whether HQ has sent a newer list. */
+const CHECK_EVERY_MS = 3 * 60 * 60 * 1000;
+/** After a failed fetch (a poor connection, the script busy), try again this much sooner. */
+const RETRY_AFTER_MS = 15 * 60 * 1000;
+/** A new list is put in place only after this long with no key press or tap: a scan is key presses. */
+const QUIET_MS = 60 * 1000;
+/** Tries for one piece before giving up until the next check. */
+const PIECE_TRIES = 3;
+
+/**
+ * @typedef {object} ProductsShareStatus
+ * @property {'off'|'idle'|'checking'|'fetching'|'ready'|'error'} state
+ *   ready: fetched, waiting for a quiet minute to put it in place
+ * @property {string} message  what to tell the person, '' when nothing to say
+ * @property {import('../src/sync/products.js').SharedProducts|null} shared  the list on the server, as last seen
+ * @property {boolean} known   the server has been asked at least once
+ */
+
+/** @type {ProductsShareStatus} */
+let shareStatus = { state: 'off', message: '', shared: null, known: false };
+/** @type {typeof fetch} */
+let request = (input, init) => fetch(input, init);
+let lastActivity = 0;
+let checking = false;
+
+const productsShareStatus = () => shareStatus;
+
+/** @param {Partial<ProductsShareStatus>} patch */
+function setShare(patch) {
+  shareStatus = { ...shareStatus, ...patch };
+  refresh();
+}
+
+/**
+ * Start asking for HQ's list: now, every few hours, and when the connection
+ * comes back. A real store only - the demo never talks to the server.
+ * @param {{send?: typeof fetch}} [opts]
+ */
+function initProductPickup(opts = {}) {
+  if (!syncUrl() || isDemoSpace()) return;
+  if (opts.send) request = opts.send;
+  const busy = () => (lastActivity = Date.now());
+  document.addEventListener('keydown', busy, true);
+  document.addEventListener('pointerdown', busy, true);
+  setShare({ state: 'idle' });
+  void checkSharedProducts();
+  setInterval(() => void checkSharedProducts(), CHECK_EVERY_MS);
+  window.addEventListener('online', () => void checkSharedProducts());
+}
+
+/** @param {string} query */
+function withQuery(query) {
+  const url = syncUrl();
+  return `${url}${url.includes('?') ? '&' : '?'}${query}`;
+}
+
+/**
+ * Ask the server what list HQ last sent.
+ * @returns {Promise<import('../src/sync/products.js').SharedProducts|null>}
+ */
+async function askSharedProducts() {
+  const res = await request(withQuery('products=info'), { method: 'GET' });
+  const reply = await res.json();
+  if (!reply?.ok) throw new Error(reply?.error ?? 'the server did not answer as expected');
+  setShare({ shared: reply.products ?? null, known: true });
+  return reply.products ?? null;
+}
+
+/** Is there a newer list from HQ? Fetch it and put it in place. */
+async function checkSharedProducts() {
+  if (checking || !syncUrl() || isDemoSpace()) return;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+  checking = true;
+  let again = false;
+  try {
+    setShare({ state: 'checking' });
+    const shared = await askSharedProducts();
+    const mine = getCatalog();
+    if (!shared || !shouldTakeShared(shared, mine.productsInfo, mine.skus.length)) {
+      setShare({ state: 'idle' });
+      return;
+    }
+    const pieces = [];
+    for (let n = 0; n < shared.pieces; n++) {
+      setShare({ state: 'fetching', message: `Fetching HQ's product list: piece ${n + 1} of ${shared.pieces}…` });
+      const piece = await fetchPiece(shared.version, n);
+      if (piece === null) {
+        // HQ sent a newer list while this one was coming: start on that one
+        again = true;
+        return;
+      }
+      pieces.push(piece);
+    }
+    const text = pieces.join('');
+    if (text.length !== shared.chars) throw new Error('it arrived incomplete');
+    const list = unpackProducts(await gunzipText(fromBase64(text)));
+    if (list.skus.length !== shared.count) throw new Error(`it held ${list.skus.length} products, not ${shared.count}`);
+
+    setShare({ state: 'ready', message: `HQ's product list has arrived (${shared.count.toLocaleString()} products); it is put in place after a minute without scanning.` });
+    if (getCatalog().skus.length) await quietMinute();
+    // this laptop's own file may have been loaded meanwhile
+    const now = getCatalog();
+    if (!shouldTakeShared(shared, now.productsInfo, now.skus.length)) {
+      setShare({ state: 'idle', message: '' });
+      return;
+    }
+    setCatalog({
+      skus: list.skus,
+      barcodes: list.barcodes,
+      productsInfo: { from: 'hq', at: shared.sentAt, name: shared.name, count: list.skus.length, version: shared.version },
+    });
+    setShare({ state: 'idle', message: `Product list from HQ in place: ${shared.count.toLocaleString()} products, sent ${new Date(shared.sentAt).toLocaleString()}.` });
+  } catch (err) {
+    setShare({
+      state: 'error',
+      message: `Could not fetch HQ's product list (${err instanceof Error ? err.message : String(err)}). It is tried again in 15 minutes; scanning carries on with the list this laptop has.`,
+    });
+    setTimeout(() => void checkSharedProducts(), RETRY_AFTER_MS);
+  } finally {
+    checking = false;
+    if (again) void checkSharedProducts();
+  }
+}
+
+/**
+ * One piece, tried a few times.
+ * @param {string} version
+ * @param {number} n
+ * @returns {Promise<string|null>} null when the list has been replaced on the server
+ */
+async function fetchPiece(version, n) {
+  let last = '';
+  for (let tries = 1; tries <= PIECE_TRIES; tries++) {
+    try {
+      const res = await request(withQuery(`products=piece&version=${encodeURIComponent(version)}&n=${n}`), { method: 'GET' });
+      const reply = await res.json();
+      if (reply?.ok && typeof reply.data === 'string') return reply.data;
+      if (reply?.replaced) return null;
+      last = reply?.error ?? 'the server did not answer as expected';
+    } catch (err) {
+      last = err instanceof Error ? err.message : String(err);
+    }
+    await pause(5000 * tries);
+  }
+  throw new Error(`piece ${n + 1}: ${last}`);
+}
+
+/** Resolves once nobody has pressed a key or tapped for QUIET_MS. */
+function quietMinute() {
+  return new Promise((resolve) => {
+    const look = () => (Date.now() - lastActivity >= QUIET_MS ? resolve(undefined) : setTimeout(look, 5000));
+    look();
+  });
+}
+
+/** @param {number} ms */
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * HQ: send this laptop's product list to every store.
+ *
+ * @param {string} password  the HQ password, typed for this send; checked again by the script
+ * @param {(sent: number, of: number) => void} onPiece
+ * @returns {Promise<import('../src/sync/products.js').SharedProducts>}
+ */
+async function sendProductsToStores(password, onPiece) {
+  if (!syncUrl()) throw new Error('No server is set (app/config.js).');
+  const catalog = getCatalog();
+  const { skus, barcodes } = catalog;
+  if (!skus.length) throw new Error('This laptop has no products to send. Load the item master first.');
+  const text = toBase64(await gzipText(packProducts(skus, barcodes)));
+  const pieces = splitPieces(text);
+  const upload = newId();
+  onPiece(0, pieces.length);
+  for (let n = 0; n < pieces.length; n++) {
+    await postProducts({ action: 'piece', password, upload, of: pieces.length, n, data: pieces[n] });
+    onPiece(n + 1, pieces.length);
+  }
+  const reply = await postProducts({
+    action: 'commit', password, upload, of: pieces.length, count: skus.length, chars: text.length,
+    name: catalog.productsInfo?.name ?? catalog.source,
+  });
+  /** @type {import('../src/sync/products.js').SharedProducts} */
+  const shared = reply.products;
+  setShare({ shared, known: true });
+  // this laptop already holds what it sent: it need not fetch it back
+  const now = getCatalog();
+  if (now.skus === skus) {
+    setCatalog({
+      productsInfo: {
+        ...(now.productsInfo ?? { from: 'file', at: new Date().toISOString(), name: now.source, count: skus.length }),
+        version: shared.version,
+      },
+    });
+  }
+  return shared;
+}
+
+/**
+ * One request of HQ's send. A lost connection is tried again; a refusal from
+ * the script (a wrong password) is not.
+ * @param {Record<string, unknown>} products
+ */
+async function postProducts(products) {
+  let last = '';
+  for (let tries = 1; tries <= PIECE_TRIES; tries++) {
+    /** @type {any} */
+    let reply;
+    try {
+      // text/plain: a "simple" request, no CORS preflight (as app/sync.js)
+      const res = await request(syncUrl(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ v: 1, products }),
+      });
+      reply = await res.json();
+    } catch (err) {
+      last = err instanceof Error ? err.message : String(err);
+      await pause(3000 * tries);
+      continue;
+    }
+    if (reply?.ok) return reply;
+    throw new Error(reply?.error ?? 'The server did not answer as expected.');
+  }
+  throw new Error(`No answer from the server (${last}).`);
+}
+
 // ===== app/stores.js =====
 /**
  * The stores this app can be logged into, and the master (HQ) login.
@@ -5783,6 +6197,7 @@ async function sendBatch() {
  * Only hashes are kept here - never the passwords (see src/auth/password.js).
  * The passwords themselves are in a private file outside the app folder. To
  * change one, run `py tools/password-hash.py` and paste the hash below.
+ * The HQ hash is also HQ_PASS_HASH in server/Code.gs: change both together.
  * To add a store, add a line with its code, Dynamics number, name and hash.
  */
 
@@ -5805,6 +6220,125 @@ const STORES = [
 /** HQ: opens setup, exports and the destructive buttons, for any store. */
 const MASTER_PASS_HASH = 'a7ff695853de62c7e2ed6fe9b2a90d9244794319e13b9520a4b08e0a6c2ad370';
 
+// ===== src/auth/password.js =====
+/**
+ * Store passwords.
+ *
+ * A store's password logs a laptop into that store; one master password (HQ)
+ * opens setup. This is a convenience gate, not security: the app runs in the
+ * browser, so anyone who can edit the page can get past it. It stops honest
+ * mistakes - a staffer wiping the record, or a laptop drifting to the wrong
+ * store - which is the risk the pilot actually has. Decided by Asim, 2 Nov 2026.
+ *
+ * The app holds no passwords, only a SHA-256 of each (salted with a fixed app
+ * prefix), so the master password cannot be read off the page source. SHA-256
+ * is written out here because the browser's own (crypto.subtle) does not exist
+ * on a page opened straight from a file. tools/password-hash.py makes the same
+ * hash for a new password.
+ */
+
+/** Same prefix in tools/password-hash.py - change both or neither. */
+const SALT = 'stockroom:';
+
+/**
+ * @typedef {object} StoreLogin
+ * @property {string} code      3-letter label code (EMP)
+ * @property {string} erpStore  D365 store number (S2004EMP)
+ * @property {string} name
+ * @property {string} passHash
+ * @property {Partial<Record<import('../domain/types.js').Category, number>>} [backStore]
+ *   back-store units by category, from the store capacity file
+ */
+
+/**
+ * What a typed password opens: a store, the master (HQ) role, or nothing.
+ * Surrounding spaces are ignored; case is not.
+ *
+ * @param {string} typed
+ * @param {readonly StoreLogin[]} stores
+ * @param {string} masterHash
+ * @returns {{role:'store', store:StoreLogin} | {role:'master'} | null}
+ */
+function checkPassword(typed, stores, masterHash) {
+  const password = typed.trim();
+  if (!password) return null;
+  const hash = passwordHash(password);
+  if (hash === masterHash) return { role: 'master' };
+  const store = stores.find((s) => s.passHash === hash);
+  return store ? { role: 'store', store } : null;
+}
+
+/**
+ * @param {string} password
+ * @returns {string} lower-case hex
+ */
+function passwordHash(password) {
+  return sha256Hex(SALT + password);
+}
+
+// ---------------------------------------------------------------- sha-256
+
+const K = [
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+/**
+ * SHA-256 of a string's UTF-8 bytes (FIPS 180-4).
+ * @param {string} text
+ * @returns {string}
+ */
+function sha256Hex(text) {
+  const data = new TextEncoder().encode(text);
+  // pad: a 1 bit, zeros, then the bit length as a 64-bit big-endian number
+  const blocks = Math.ceil((data.length + 9) / 64);
+  const bytes = new Uint8Array(blocks * 64);
+  bytes.set(data);
+  bytes[data.length] = 0x80;
+  const view = new DataView(bytes.buffer);
+  const bits = data.length * 8;
+  view.setUint32(bytes.length - 8, Math.floor(bits / 0x100000000));
+  view.setUint32(bytes.length - 4, bits >>> 0);
+
+  const h = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+  const w = new Uint32Array(64);
+  /** @param {number} x @param {number} n */
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+
+  for (let block = 0; block < blocks; block++) {
+    for (let i = 0; i < 16; i++) w[i] = view.getUint32(block * 64 + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const a = /** @type {number} */ (w[i - 15]);
+      const b = /** @type {number} */ (w[i - 2]);
+      const s0 = rotr(a, 7) ^ rotr(a, 18) ^ (a >>> 3);
+      const s1 = rotr(b, 17) ^ rotr(b, 19) ^ (b >>> 10);
+      w[i] = (/** @type {number} */ (w[i - 16]) + s0 + /** @type {number} */ (w[i - 7]) + s1) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, hh] = /** @type {[number,number,number,number,number,number,number,number]} */ (h);
+    for (let i = 0; i < 64; i++) {
+      const t1 = (hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + /** @type {number} */ (K[i]) + /** @type {number} */ (w[i])) >>> 0;
+      const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+      hh = g;
+      g = f;
+      f = e;
+      e = (d + t1) >>> 0;
+      d = c;
+      c = b;
+      b = a;
+      a = (t1 + t2) >>> 0;
+    }
+    const add = [a, b, c, d, e, f, g, hh];
+    for (let i = 0; i < 8; i++) h[i] = (/** @type {number} */ (h[i]) + /** @type {number} */ (add[i])) >>> 0;
+  }
+  return h.map((x) => x.toString(16).padStart(8, '0')).join('');
+}
+
 // ===== app/setup.js =====
 /**
  * Setup: getting a store's own data in, and what it recorded back out.
@@ -5814,6 +6348,8 @@ const MASTER_PASS_HASH = 'a7ff695853de62c7e2ed6fe9b2a90d9244794319e13b9520a4b08e
  * bin labels, works all day offline, and exports what it recorded. Every step
  * is one the store already knows how to do.
  */
+
+
 
 
 
@@ -6127,7 +6663,7 @@ function initSetup(host) {
         ]);
         return;
       }
-      setCatalog({ skus, barcodes: [...barcodes.entries()] });
+      setCatalog({ skus, barcodes: [...barcodes.entries()], productsInfo: loadedHere(file, skus.length) });
       const withoutBarcode = skus.length - new Set(barcodes.values()).size;
       const notes = errors.slice();
       if (withoutBarcode > 0) {
@@ -6162,7 +6698,7 @@ function initSetup(host) {
       say('No products could be read from that file.', r.errors.length ? r.errors : ['The file is empty.']);
       return;
     }
-    setCatalog({ skus: r.skus, barcodes: [...r.barcodes.entries()] });
+    setCatalog({ skus: r.skus, barcodes: [...r.barcodes.entries()], productsInfo: loadedHere(file, r.skus.length) });
     const seconds = Math.round((performance.now() - started) / 1000);
     const notes = [
       `${r.rows.toLocaleString()} rows read in ${seconds} s.`,
@@ -6174,10 +6710,72 @@ function initSetup(host) {
     if (r.kitsUnreadable) notes.push(`${count(r.kitsUnreadable, 'kit does', 'kits do')} not say how many pieces it holds; counted one piece per box.`);
     if (r.noBarcode) notes.push(`${count(r.noBarcode, 'row has', 'rows have')} no bar code and cannot be scanned; left out.`);
     if (r.duplicates) notes.push(`${count(r.duplicates, 'bar code appears', 'bar codes appear')} twice; the first row was kept.`);
+    if (!isDemo && syncUrl()) notes.push('Next: send it to all stores (3b, below), so every store laptop has it too.');
     say(`Loaded ${r.skus.length.toLocaleString()} products from the item master.`, [], 'good');
     // the notes are facts, not problems: shown in the same green box
     report.innerHTML += `<ul>${notes.map((n) => `<li>${escapeHtml(n)}</li>`).join('')}</ul>`;
   }
+
+  /**
+   * @param {File} file
+   * @param {number} count
+   * @returns {import('../src/sync/products.js').ProductsInfo}
+   */
+  const loadedHere = (file, count) => ({ from: 'file', at: new Date().toISOString(), name: file.name, count });
+
+  // ---------------------------------------------------------------- products to all stores
+
+  // HQ sends this laptop's list; every store laptop picks it up (app/products-share.js)
+  el('share-step').hidden = isDemo || host.login.role !== 'master';
+  const sharePass = /** @type {HTMLInputElement} */ (el('share-pass'));
+  const shareSend = /** @type {HTMLButtonElement} */ (el('share-send'));
+  shareSend.addEventListener('click', async () => {
+    if (!syncUrl()) return say('No server is set, so the list cannot be sent. See server/SETUP.md.');
+    if (!getCatalog().skus.length) return say('This laptop has no products yet. Load the item master first (3, above).');
+    if (checkPassword(sharePass.value, STORES, MASTER_PASS_HASH)?.role !== 'master') {
+      return say('That is not the HQ password.', ['Only HQ can send the product list to the stores.']);
+    }
+    shareSend.disabled = true;
+    const started = performance.now();
+    try {
+      const shared = await sendProductsToStores(sharePass.value, (sent, of) =>
+        say(`Sending the product list to all stores… ${sent} of ${of} pieces sent.`, [], 'good'),
+      );
+      const seconds = Math.round((performance.now() - started) / 1000);
+      say(`Sent: ${shared.count.toLocaleString()} products, in ${seconds} s.`, [], 'good');
+      report.innerHTML += `<ul><li>${escapeHtml('Every store laptop picks it up the next time it is open with internet, in the background.')}</li></ul>`;
+    } catch (err) {
+      say('The product list was not sent.', [err instanceof Error ? err.message : String(err), 'Nothing changed for the stores. Try again.']);
+    } finally {
+      sharePass.value = '';
+      shareSend.disabled = false;
+      renderShare();
+    }
+  });
+
+  /** What this laptop holds, and what the stores were last sent. */
+  function renderShare() {
+    if (el('share-step').hidden) return;
+    const catalog = getCatalog();
+    const info = catalog.productsInfo;
+    const share = productsShareStatus();
+    /** @param {string} iso */
+    const when = (iso) => new Date(iso).toLocaleString();
+    const here = !catalog.skus.length
+      ? 'This laptop has no products yet.'
+      : info
+        ? `This laptop: ${catalog.skus.length.toLocaleString()} products, ${info.from === 'hq' ? `HQ's list sent ${when(info.at)}` : `from ${info.name}, loaded ${when(info.at)}`}.`
+        : `This laptop: ${catalog.skus.length.toLocaleString()} products.`;
+    const shared = share.shared;
+    const there = !share.known
+      ? 'What the stores have: not known yet (no answer from the server).'
+      : !shared
+        ? 'Nothing has been sent to the stores yet.'
+        : `Last sent to the stores: ${shared.count.toLocaleString()} products from ${shared.name}, on ${when(shared.sentAt)}` +
+          (info?.version === shared.version ? ' - the list on this laptop.' : '.');
+    el('share-state').textContent = `${here} ${there}`;
+  }
+  if (!el('share-step').hidden && syncUrl()) askSharedProducts().catch(() => {}).finally(renderShare);
 
   // ---------------------------------------------------------------- templates
 
@@ -6505,7 +7103,9 @@ function initSetup(host) {
     renderLedger();
     renderShelfStatus();
     renderSync();
+    renderShare();
   });
+  renderShare();
   renderSync();
   renderChips();
   renderLedger();
@@ -7152,125 +7752,6 @@ function normCode(s) {
   return s.trim().toLowerCase();
 }
 
-// ===== src/auth/password.js =====
-/**
- * Store passwords.
- *
- * A store's password logs a laptop into that store; one master password (HQ)
- * opens setup. This is a convenience gate, not security: the app runs in the
- * browser, so anyone who can edit the page can get past it. It stops honest
- * mistakes - a staffer wiping the record, or a laptop drifting to the wrong
- * store - which is the risk the pilot actually has. Decided by Asim, 2 Nov 2026.
- *
- * The app holds no passwords, only a SHA-256 of each (salted with a fixed app
- * prefix), so the master password cannot be read off the page source. SHA-256
- * is written out here because the browser's own (crypto.subtle) does not exist
- * on a page opened straight from a file. tools/password-hash.py makes the same
- * hash for a new password.
- */
-
-/** Same prefix in tools/password-hash.py - change both or neither. */
-const SALT = 'stockroom:';
-
-/**
- * @typedef {object} StoreLogin
- * @property {string} code      3-letter label code (EMP)
- * @property {string} erpStore  D365 store number (S2004EMP)
- * @property {string} name
- * @property {string} passHash
- * @property {Partial<Record<import('../domain/types.js').Category, number>>} [backStore]
- *   back-store units by category, from the store capacity file
- */
-
-/**
- * What a typed password opens: a store, the master (HQ) role, or nothing.
- * Surrounding spaces are ignored; case is not.
- *
- * @param {string} typed
- * @param {readonly StoreLogin[]} stores
- * @param {string} masterHash
- * @returns {{role:'store', store:StoreLogin} | {role:'master'} | null}
- */
-function checkPassword(typed, stores, masterHash) {
-  const password = typed.trim();
-  if (!password) return null;
-  const hash = passwordHash(password);
-  if (hash === masterHash) return { role: 'master' };
-  const store = stores.find((s) => s.passHash === hash);
-  return store ? { role: 'store', store } : null;
-}
-
-/**
- * @param {string} password
- * @returns {string} lower-case hex
- */
-function passwordHash(password) {
-  return sha256Hex(SALT + password);
-}
-
-// ---------------------------------------------------------------- sha-256
-
-const K = [
-  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-];
-
-/**
- * SHA-256 of a string's UTF-8 bytes (FIPS 180-4).
- * @param {string} text
- * @returns {string}
- */
-function sha256Hex(text) {
-  const data = new TextEncoder().encode(text);
-  // pad: a 1 bit, zeros, then the bit length as a 64-bit big-endian number
-  const blocks = Math.ceil((data.length + 9) / 64);
-  const bytes = new Uint8Array(blocks * 64);
-  bytes.set(data);
-  bytes[data.length] = 0x80;
-  const view = new DataView(bytes.buffer);
-  const bits = data.length * 8;
-  view.setUint32(bytes.length - 8, Math.floor(bits / 0x100000000));
-  view.setUint32(bytes.length - 4, bits >>> 0);
-
-  const h = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
-  const w = new Uint32Array(64);
-  /** @param {number} x @param {number} n */
-  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
-
-  for (let block = 0; block < blocks; block++) {
-    for (let i = 0; i < 16; i++) w[i] = view.getUint32(block * 64 + i * 4);
-    for (let i = 16; i < 64; i++) {
-      const a = /** @type {number} */ (w[i - 15]);
-      const b = /** @type {number} */ (w[i - 2]);
-      const s0 = rotr(a, 7) ^ rotr(a, 18) ^ (a >>> 3);
-      const s1 = rotr(b, 17) ^ rotr(b, 19) ^ (b >>> 10);
-      w[i] = (/** @type {number} */ (w[i - 16]) + s0 + /** @type {number} */ (w[i - 7]) + s1) >>> 0;
-    }
-    let [a, b, c, d, e, f, g, hh] = /** @type {[number,number,number,number,number,number,number,number]} */ (h);
-    for (let i = 0; i < 64; i++) {
-      const t1 = (hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + /** @type {number} */ (K[i]) + /** @type {number} */ (w[i])) >>> 0;
-      const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
-      hh = g;
-      g = f;
-      f = e;
-      e = (d + t1) >>> 0;
-      d = c;
-      c = b;
-      b = a;
-      a = (t1 + t2) >>> 0;
-    }
-    const add = [a, b, c, d, e, f, g, hh];
-    for (let i = 0; i < 8; i++) h[i] = (/** @type {number} */ (h[i]) + /** @type {number} */ (add[i])) >>> 0;
-  }
-  return h.map((x) => x.toString(16).padStart(8, '0')).join('');
-}
-
 // ===== app/login.js =====
 /**
  * Logging a laptop into a store.
@@ -7487,6 +7968,7 @@ function showLogin(opts) {
  * a staff member does is scan, scan, and one button. The one keypad is the bulk
  * pad, and it only opens from an unstitched line (HANDOVER §4.3).
  */
+
 
 
 
@@ -7786,6 +8268,10 @@ function render() {
     else if (sync === 'offline') text = `offline · ${waiting} to send`;
     else text = `${waiting} to send`;
     ok = sync !== 'off' && (waiting === 0 || sync === 'sending');
+    const products = productsShareStatus();
+    if (products.state === 'fetching') text += ' · new products coming';
+    else if (products.state === 'ready') text += ' · new products ready';
+    queueEl.title = products.message;
   }
   queueEl.textContent = text;
   dot.classList.toggle('pending', !ok);
@@ -8119,6 +8605,8 @@ async function boot(chosen) {
   // a real store's record goes to the server; the demo's never does
   if (store && chosen.role !== 'demo') {
     initSync({ store: store.code, erpStore: store.erpStore, device: deps.deviceId });
+    // and HQ's weekly product list comes to it, in the background
+    initProductPickup();
   }
   render();
 }
