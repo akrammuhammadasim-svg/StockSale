@@ -14,7 +14,7 @@
  * build-standalone.py writes the version below, so every build is a new cache.
  */
 
-const VERSION = 'f44d2f44cfa1';
+const VERSION = '974b75dc9d91';
 const CACHE = `stockroom-${VERSION}`;
 const FILES = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 
