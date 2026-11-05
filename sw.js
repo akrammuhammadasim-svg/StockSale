@@ -4,8 +4,14 @@
  * A stockroom has no reliable connection, so the app must open without one.
  * This keeps the app's few files on the laptop and serves them from there
  * first - opening is instant, signal or not - while fetching a fresh copy in
- * the background for next time. New versions therefore arrive one opening
- * later, never in the middle of a delivery.
+ * the background for next time. A new version is taken in by itself: the page
+ * opens it once the laptop has been left alone for a minute (app/main.js),
+ * never in the middle of a delivery.
+ *
+ * Every fetch here asks the server, not the browser's own store: GitHub Pages
+ * lets a browser keep a file 10 minutes, and v8 once saved that old page under
+ * its new name - the laptop showed the old version until Ctrl+Shift+R, and
+ * again after signing in (4 Nov 2026).
  *
  * It only ever handles the app's own files. Records sent to the Google Sheet
  * are not touched: they live in the app's outbox until the server confirms
@@ -14,7 +20,7 @@
  * build-standalone.py writes the version below, so every build is a new cache.
  */
 
-const VERSION = '974b75dc9d91';
+const VERSION = '1f0340a94fb2';
 const CACHE = `stockroom-${VERSION}`;
 const FILES = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 
@@ -22,7 +28,8 @@ self.addEventListener('install', (event) => {
   event.waitUntil(
     caches
       .open(CACHE)
-      .then((cache) => cache.addAll(FILES))
+      // straight from the server (cache: 'reload'), never a copy the browser still holds
+      .then((cache) => cache.addAll(FILES.map((f) => new Request(f, { cache: 'reload' }))))
       .then(() => self.skipWaiting()),
   );
 });
@@ -47,7 +54,8 @@ self.addEventListener('fetch', (event) => {
       // the page itself may be asked for as "./" or "./index.html"
       const cached = (await cache.match(request, { ignoreSearch: true })) ??
         (request.mode === 'navigate' ? await cache.match('./index.html') : undefined);
-      const fresh = fetch(request)
+      // 'no-cache': the browser asks the server whether its copy is still current
+      const fresh = fetch(request, { cache: 'no-cache' })
         .then((response) => {
           if (response.ok) cache.put(request, response.clone());
           return response;
